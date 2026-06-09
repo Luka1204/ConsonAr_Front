@@ -5,174 +5,226 @@ import type { RecordedNote } from "./noteRecorder";
 const YIN_typed = YIN as unknown as (config: Record<string, unknown>) => (buffer: Float32Array) => number | null;
 
 /**
- * Corrige octavas erróneas comunes de YIN.
- * YIN a menudo detecta una octava abajo de la real.
+ * Analiza un archivo de audio usando YIN con configuración mejorada.
+ * Incluye mejor detección de octavas y estabilidad de notas.
  */
-function correctOctave(freq: number): number {
-  // Notas en el rango 65-130 Hz probablemente deberían ser 130-260
-  if (freq >= 65 && freq < 130) return freq * 2;
-  // Notas muy bajas (<65 Hz) no son comunes en melodías, multiplicar
-  if (freq >= 30 && freq < 65) return freq * 4;
-  return freq;
-}
-
-/**
- * Analiza un archivo de audio decodificado y extrae las notas musicales.
- */
-export async function analyzeAudioFile(file: File): Promise<{
+export async function analyzeAudioFile(
+  file: File,
+  onProgress?: (percent: number, message: string) => void
+): Promise<{
   notes: RecordedNote[];
   sampleRate: number;
   durationMs: number;
 }> {
   const audioBuffer = await decodeAudioFile(file);
   const sampleRate = audioBuffer.sampleRate;
-  const channelData = audioBuffer.getChannelData(0);
-  const durationMs = (channelData.length / sampleRate) * 1000;
+  const ch = audioBuffer.getChannelData(0);
+
+  // Análisis en el main thread con reportes de progreso
+  return analyzeAudioDataOptimized(ch, sampleRate, onProgress);
+}
+
+/**
+ * Análisis optimizado con mejor detección de notas
+ */
+export function analyzeAudioDataOptimized(
+  ch: Float32Array,
+  sampleRate: number,
+  onProgress?: (percent: number, message: string) => void
+): { notes: RecordedNote[]; sampleRate: number; durationMs: number } {
+  const durationMs = (ch.length / sampleRate) * 1000;
+  const baseTime = Date.now();
 
   const detectPitch = YIN_typed({
     sampleRate,
-    minFrequency: 80,
-    maxFrequency: 1200,
-    threshold: 0.12,
+    minFrequency: 50,  // Detectar notas bajas
+    maxFrequency: 800, // Permitir notas más agudas
+    threshold: 0.1,  // Menos sensible al ruido
   });
 
-  const windowSize = 4096;
-  const hopSize = Math.floor(windowSize / 3);
-  const baseTime = Date.now();
-  const rawFrames: { timeMs: number; freq: number; noteName: string; midi: number }[] = [];
+  const hopSize = Math.floor(sampleRate * 0.015); // ~15ms
+  const windowSize = 2048;
+  const rawNotes: { t: number; note: string; midi: number; confidence: number }[] = [];
 
   let stableNote = "";
   let stableCount = 0;
+  let lastValidPitch = 0;
+  const totalFrames = Math.floor((ch.length - windowSize) / hopSize);
+  let processedFrames = 0;
 
-  for (let i = 0; i + windowSize < channelData.length; i += hopSize) {
-    const frame = channelData.slice(i, i + windowSize);
-    const timeMs = (i / sampleRate) * 1000;
+  for (let pos = 0; pos + windowSize < ch.length; pos += hopSize) {
+    processedFrames++;
 
-    // RMS
+    // Reportar progreso
+    if (processedFrames % 50 === 0 && onProgress) {
+      const percent = Math.floor((processedFrames / totalFrames) * 100);
+      onProgress(percent, `Procesando... ${percent}%`);
+    }
+
+    const t = (pos / sampleRate) * 1000;
+    const frame = ch.slice(pos, pos + windowSize);
+
+    // Calcular RMS y amplitud máxima
     let rms = 0;
-    for (let j = 0; j < frame.length; j++) rms += frame[j] * frame[j];
+    let maxAmp = 0;
+    for (let j = 0; j < frame.length; j++) {
+      const val = Math.abs(frame[j]);
+      rms += frame[j] * frame[j];
+      maxAmp = Math.max(maxAmp, val);
+    }
     rms = Math.sqrt(rms / frame.length);
 
-    if (rms > 0.008) {
-      let pitch = detectPitch(frame);
-      if (pitch && pitch > 30 && pitch < 1500) {
-        // Corregir octava
-        pitch = correctOctave(pitch);
-        // Re-verificar rango después de corrección
-        if (pitch < 80 || pitch > 1200) continue;
-
-        const detected = frequencyToNote(pitch);
-        const noteName = detected.note;
-
-        // Requerir 4 frames consecutivos de la misma nota para estabilidad
-        if (noteName === stableNote) {
-          stableCount++;
-        } else {
-          stableNote = noteName;
-          stableCount = 1;
-        }
-
-        if (stableCount >= 4) {
-          rawFrames.push({
-            timeMs,
-            freq: pitch,
-            noteName,
-            midi: detected.midiNumber,
-          });
-        }
-      } else {
-        stableNote = "";
-        stableCount = 0;
-      }
-    } else {
+    // Threshold dinámico muy bajo para capturar más notas
+    if (rms < 0.0001 || maxAmp < 0.0002) {
       stableNote = "";
       stableCount = 0;
+      continue;
+    }
+
+    const pitch = detectPitch(frame);
+    if (!pitch) {
+      stableNote = "";
+      stableCount = 0;
+      continue;
+    }
+
+    // Corrector de octava mejorado
+    let correctedPitch = correctOctave(pitch);
+    // Rango más amplio: desde E2 (82 Hz) hasta notas altas
+    if (correctedPitch < 50 || correctedPitch > 800) continue;
+
+    // Validar cambios de frecuencia no erráticos
+    if (lastValidPitch > 0) {
+      const ratio = correctedPitch / lastValidPitch;
+      // Permitir cambios más naturales (saltos de octava)
+      if (ratio > 2.0 || ratio < 0.5) {
+        stableNote = "";
+        stableCount = 0;
+        continue;
+      }
+    }
+    lastValidPitch = correctedPitch;
+
+    const d = frequencyToNote(correctedPitch);
+    const confidence = rms / (maxAmp + 0.0001);
+
+    // Estabilidad de notas
+    if (d.note === stableNote) {
+      stableCount++;
+    } else {
+      stableNote = d.note;
+      stableCount = 1;
+    }
+
+    if (stableCount >= 1) {
+      rawNotes.push({ t, note: d.note, midi: d.midiNumber, confidence });
     }
   }
 
-  // Agrupar frames consecutivos en notas
-  const grouped: { noteName: string; midi: number; freq: number; startMs: number; endMs: number }[] = [];
-
-  if (rawFrames.length === 0) {
+  // Agrupar notas consecutivas
+  const grouped: { note: string; midi: number; start: number; end: number }[] = [];
+  if (rawNotes.length === 0) {
     return { notes: [], sampleRate, durationMs };
   }
 
-  let g = {
-    noteName: rawFrames[0].noteName,
-    midi: rawFrames[0].midi,
-    freq: rawFrames[0].freq,
-    startMs: rawFrames[0].timeMs,
-    endMs: rawFrames[0].timeMs,
-    count: 1,
+  let grp = {
+    note: rawNotes[0].note,
+    midi: rawNotes[0].midi,
+    start: rawNotes[0].t,
+    end: rawNotes[0].t,
   };
 
-  for (let i = 1; i < rawFrames.length; i++) {
-    const f = rawFrames[i];
-    if (f.noteName !== g.noteName || (f.timeMs - rawFrames[i - 1].timeMs) > 400) {
-      const dur = g.endMs - g.startMs;
-      if (dur >= 100) {
-        grouped.push({ noteName: g.noteName, midi: g.midi, freq: g.freq, startMs: g.startMs, endMs: g.endMs });
+  for (let i = 1; i < rawNotes.length; i++) {
+    const r = rawNotes[i];
+    const gap = r.t - rawNotes[i - 1].t;
+
+    if (r.note !== grp.note || gap > 100) {
+      const dur = grp.end - grp.start;
+      if (dur >= 20) {
+        grouped.push({ note: grp.note, midi: grp.midi, start: grp.start, end: grp.end });
       }
-      g = { noteName: f.noteName, midi: f.midi, freq: f.freq, startMs: f.timeMs, endMs: f.timeMs, count: 1 };
+      grp = { note: r.note, midi: r.midi, start: r.t, end: r.t };
     } else {
-      g.endMs = f.timeMs;
-      g.count++;
-      g.freq = (g.freq * (g.count - 1) + f.freq) / g.count;
+      grp.end = r.t;
     }
   }
-  const lastDur = g.endMs - g.startMs;
-  if (lastDur >= 100) {
-    grouped.push({ noteName: g.noteName, midi: g.midi, freq: g.freq, startMs: g.startMs, endMs: g.endMs });
+
+  const ld = grp.end - grp.start;
+  if (ld >= 20) {
+    grouped.push({ note: grp.note, midi: grp.midi, start: grp.start, end: grp.end });
   }
 
-  // Convertir a RecordedNote
+  // Crear notas finales
   const notes: RecordedNote[] = grouped.map((g) => ({
-    note: g.noteName,
+    note: g.note,
     midiNumber: g.midi,
-    frequency: Math.round(g.freq * 10) / 10,
-    startTime: baseTime + g.startMs,
-    endTime: baseTime + g.endMs,
-    duration: g.endMs - g.startMs,
+    frequency: 440 * Math.pow(2, (g.midi - 69) / 12),
+    startTime: baseTime + g.start,
+    endTime: baseTime + g.end,
+    duration: g.end - g.start,
   }));
 
-  // Limitar a max 100 notas
-  let finalNotes = notes;
-  if (notes.length > 100) {
-    const step = Math.ceil(notes.length / 100);
-    finalNotes = notes.filter((_, i) => i % step === 0);
-  }
+  notes.sort((a, b) => a.startTime - b.startTime);
 
-  // Normalizar timestamps
-  if (finalNotes.length > 0) {
-    const first = finalNotes[0].startTime;
-    for (const n of finalNotes) {
+  // Aumentar límite a 500 notas para mejor precisión
+  const maxNotes = 500;
+  const final =
+    notes.length > maxNotes ? notes.filter((_, i) => i % Math.ceil(notes.length / maxNotes) === 0) : notes;
+
+  if (final.length > 0) {
+    const first = final[0].startTime;
+    for (const n of final) {
       n.startTime -= first;
       n.endTime -= first;
     }
   }
 
-  console.log(`AudioAnalyzer: ${rawFrames.length} frames → ${grouped.length} grupos → ${finalNotes.length} notas`);
+  console.log(
+    `AudioAnalyzer: ${rawNotes.length} frames → ${grouped.length} grupos → ${final.length} notas`
+  );
+  return { notes: final, sampleRate, durationMs };
+}
 
-  return { notes: finalNotes, sampleRate, durationMs };
+/**
+ * Corrige errores de detección de octava
+ */
+function correctOctave(pitch: number): number {
+  let correctedPitch = pitch;
+
+  // Si la frecuencia es demasiado baja, intentar octavas arriba
+  if (pitch < 80) {
+    while (correctedPitch < 80 && correctedPitch * 2 <= 2000) {
+      correctedPitch *= 2;
+    }
+  }
+
+  // Si la frecuencia es demasiado alta, intentar octavas abajo
+  if (pitch > 1500) {
+    while (correctedPitch > 1500 && correctedPitch / 2 >= 50) {
+      correctedPitch /= 2;
+    }
+  }
+
+  return correctedPitch;
 }
 
 async function decodeAudioFile(file: File): Promise<AudioBuffer> {
-  const arrayBuffer = await file.arrayBuffer();
-  const audioContext = new AudioContext();
-  const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-  await audioContext.close();
-  return audioBuffer;
+  const buf = await file.arrayBuffer();
+  const ac = new AudioContext();
+  const ab = await ac.decodeAudioData(buf);
+  await ac.close();
+  return ab;
 }
 
 export function getSupportedAudioFormats(): string[] {
-  const audio = document.createElement("audio");
-  const formats: string[] = [];
-  if (audio.canPlayType("audio/mpeg") !== "") formats.push(".mp3");
-  if (audio.canPlayType("audio/wav") !== "") formats.push(".wav");
-  if (audio.canPlayType("audio/ogg") !== "") formats.push(".ogg");
-  if (audio.canPlayType("audio/flac") !== "") formats.push(".flac");
-  if (audio.canPlayType("audio/aac") !== "") formats.push(".aac");
-  if (audio.canPlayType("audio/m4a") !== "") formats.push(".m4a");
-  if (formats.length === 0) formats.push(".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a");
-  return formats;
+  const a = document.createElement("audio");
+  const f: string[] = [];
+  if (a.canPlayType("audio/mpeg") !== "") f.push(".mp3");
+  if (a.canPlayType("audio/wav") !== "") f.push(".wav");
+  if (a.canPlayType("audio/ogg") !== "") f.push(".ogg");
+  if (a.canPlayType("audio/flac") !== "") f.push(".flac");
+  if (a.canPlayType("audio/aac") !== "") f.push(".aac");
+  if (a.canPlayType("audio/m4a") !== "") f.push(".m4a");
+  if (f.length === 0) f.push(".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a");
+  return f;
 }

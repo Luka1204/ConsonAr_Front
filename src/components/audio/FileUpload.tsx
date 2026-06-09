@@ -23,7 +23,10 @@ export default function FileUpload({ onNotesDetected }: Props) {
     setProgress(`Decodificando ${file.name}...`);
 
     try {
-      const result = await analyzeAudioFile(file);
+      const result = await analyzeAudioFile(file, (_percent, message) => {
+        setProgress(`${message}`);
+      });
+
       setProgress(`Analizando ${result.notes.length} notas detectadas...`);
 
       if (result.notes.length === 0) {

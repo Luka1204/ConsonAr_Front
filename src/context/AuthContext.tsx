@@ -1,7 +1,7 @@
 import {
   createContext,
   useState,
-  ReactNode,
+  type ReactNode,
 } from "react";
 
 type AuthContextType = {

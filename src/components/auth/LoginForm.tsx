@@ -1,72 +1,43 @@
-import {
-  useContext,
-  useState,
-  ChangeEvent,
-  FormEvent,
-} from "react";
+import { useContext, useState, type ChangeEvent, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { login } from "../../services/auth.service";
-
 import { AuthContext } from "../../context/AuthContext";
 
 export default function LoginForm() {
-
-  const { saveToken } =
-    useContext(AuthContext);
-
+  const { saveToken } = useContext(AuthContext);
   const navigate = useNavigate();
+  const [form, setForm] = useState({ email: "", password: "" });
 
-  const [form, setForm] = useState({
-    email: "",
-    password: "",
-  });
-
-  const handleChange = (
-    e: ChangeEvent<HTMLInputElement>
-  ) => {
-
-    setForm({
-      ...form,
-      [e.target.name]: e.target.value,
-    });
+  const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
+    setForm({ ...form, [e.target.name]: e.target.value });
   };
 
-  const handleSubmit = async (
-    e: FormEvent
-  ) => {
-
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-
     const data = await login(form);
-
     saveToken(data.access_token);
-
-    alert("Login exitoso");
-
     navigate("/dashboard");
   };
 
   return (
-    <form onSubmit={handleSubmit}>
-
+    <form className="login-form" onSubmit={handleSubmit}>
       <input
         type="email"
         name="email"
         placeholder="Email"
         onChange={handleChange}
+        required
       />
-
       <input
         type="password"
         name="password"
-        placeholder="Password"
+        placeholder="Contraseña"
         onChange={handleChange}
+        required
       />
-
-      <button type="submit">
+      <button type="submit" className="login-submit animate-fade-in">
         Iniciar sesión
       </button>
-
     </form>
   );
 }
